@@ -1,4 +1,5 @@
 import os
+import re # Added for URL extraction
 
 from agent.tools_and_schemas import SearchQueryList, Reflection
 from dotenv import load_dotenv
@@ -7,7 +8,6 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
 
 from agent.state import (
     OverallState,
@@ -23,21 +23,15 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from agent.utils import (
-    get_citations,
     get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
 )
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
-
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+if os.getenv("OPENROUTER_API_KEY") is None:
+    raise ValueError("OPENROUTER_API_KEY is not set")
 
 
 # Nodes
@@ -60,12 +54,13 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
+    # init ChatOpenAI
+    llm = ChatOpenAI(
+        model=configurable.query_generator_model,  # This will need to be an OpenRouter model name
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
     )
     structured_llm = llm.with_structured_output(SearchQueryList)
 
@@ -111,28 +106,37 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         research_topic=state["search_query"],
     )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
+    # Configure ChatOpenAI for web search using an ":online" model
+    online_model_name = f"{configurable.query_generator_model}:online"
+    llm = ChatOpenAI(
+        model=online_model_name,
+        temperature=0.7, # Adjusted temperature for potentially creative/summary responses
+        max_retries=2,
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
     )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+
+    # Invoke the LLM to perform the web search and get content
+    # The web_searcher_instructions should guide the model to search and cite
+    response = llm.invoke(formatted_prompt)
+    modified_text = response.content
+
+    # Simplified approach for sources: extract URLs from the model's response
+    # This assumes the :online model embeds URLs in its response.
+    # This is a basic extraction and might need refinement.
+    try:
+        # A simple regex to find URLs. This may not be exhaustive.
+        urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', modified_text)
+        # Remove duplicates and ensure they are strings
+        sources_gathered = sorted(list(set(str(url) for url in urls if isinstance(url, str))))
+    except Exception:
+        sources_gathered = ["Error extracting URLs from response."]
+
 
     return {
-        "sources_gathered": sources_gathered,
+        "sources_gathered": sources_gathered, # Now a list of URL strings
         "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
+        "web_research_result": [modified_text], # The direct response from the LLM
     }
 
 
@@ -163,11 +167,12 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
+    llm = ChatOpenAI(
+        model=reasoning_model,  # This will need to be an OpenRouter model name
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
     )
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
@@ -241,12 +246,13 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
+    # init Reasoning Model, default to an OpenRouter model
+    llm = ChatOpenAI(
+        model=reasoning_model,  # This will need to be an OpenRouter model name
         temperature=0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
     )
     result = llm.invoke(formatted_prompt)
 
